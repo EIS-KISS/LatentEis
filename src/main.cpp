@@ -1,4 +1,3 @@
-#include <ios>
 #include <iostream>
 #include <cstdint>
 #include <string>
@@ -8,6 +7,7 @@
 #include <algorithm>
 #include <cassert>
 #include <map>
+#include <valarray>
 #include "nanoflann.h"
 
 #include "tokenize.h"
@@ -86,7 +86,7 @@ public:
 
 	void add(const LatentPoint& in) {points.push_back(in);}
 
-	Box boundingBox();
+	Box boundingBox() const;
 
 	void remove(size_t index);
 	void removeMarked();
@@ -173,6 +173,29 @@ std::vector<LatentDataset> LatentDataset::splitByClass()
 	return datasets;
 }
 
+Box LatentDataset::boundingBox() const
+{
+	std::valarray<float> xes(points.size());
+	std::valarray<float> yes(points.size());
+	std::valarray<float> zes(points.size());
+	for(size_t i = 0; i < points.size(); ++i)
+	{
+		xes[i] = points[i].x;
+		yes[i] = points[i].y;
+		zes[i] = points[i].z;
+	}
+
+	Box box;
+	box.x = xes.min();
+	box.y = yes.min();
+	box.z = zes.min();
+	box.width = xes.max() - box.x;
+	box.depth = yes.max() - box.y;
+	box.height = zes.max() - box.z;
+	box.volume = box.width*box.depth*box.height;
+	return box;
+}
+
 float weightFn(float distance, float searchRadius)
 {
 	return 1.0f - (distance/searchRadius);
@@ -222,36 +245,53 @@ int main(int argc, char** argv)
 	LatentDataset trainDataset(argv[1]);
 	LatentDataset testDataset(argv[2]);
 
-	pruneDataset(trainDataset, 0.3);
-
+	pruneDataset(trainDataset, 2);
 	std::vector<LatentDataset> classDatasets = trainDataset.splitByClass();
 
-	trainDataset.save("pruned.csv");
-
 	nanoflann::KDTreeSingleIndexAdaptorParams params;
-	nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<float, LatentDataset>, LatentDataset, 3, size_t> kdtree(3, trainDataset, params);
-	kdtree.buildIndex();
 
-	std::fstream file("kdtree.bin", std::ios_base::out);
-	if(!file.is_open())
+	std::vector<nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<float, LatentDataset>, LatentDataset, 3, size_t>*> kdtrees;
+	std::vector<float> distances;
+	for(const LatentDataset& dataset : classDatasets)
 	{
-		std::cout<<"Can not open kdtree.bin for writeing";
-		return 1;
+		kdtrees.push_back(new nanoflann::KDTreeSingleIndexAdaptor<nanoflann::L2_Simple_Adaptor<float, LatentDataset>, LatentDataset, 3, size_t>(3, dataset, params));
+		float density = dataset.boundingBox().volume / dataset.kdtree_get_point_count();
+		float searchRadius = std::max(6.0f*std::pow(density, 1/3.0f), 2.0f);
+		std::cout<<"searchRadius: "<<searchRadius<<'\n';
+		distances.push_back(searchRadius);
+		kdtrees.back()->buildIndex();
 	}
-	kdtree.saveIndex(file);
-	file.close();
+
+	for(size_t i = 0; i < kdtrees.size(); ++i)
+	{
+		std::string name = "kdtree_" + std::to_string(i) + ".bin";
+		std::fstream file("kdtree.bin", std::ios_base::out);
+		if(!file.is_open())
+		{
+			std::cout<<"Can not open kdtree.bin for writeing";
+			return 1;
+		}
+		kdtrees[i]->saveIndex(file);
+		file.close();
+	}
 
 	size_t hit = 0;
 	size_t miss = 0;
 	size_t unkown = 0;
 
-	static constexpr float searchRadius = 2;
 
 	for(size_t i = 0; i < testDataset.kdtree_get_point_count(); ++i)
 	{
 		std::cout<<"\ntesting point: "<<testDataset[i].x<<' '<<testDataset[i].y<<' '<<testDataset[i].z<<" class: "<<testDataset[i].classId<<'\n';
-		std::vector<nanoflann::ResultItem<size_t, float>> results;
-		kdtree.radiusSearch(testDataset.getPoint(i), searchRadius, results);
+		std::vector<std::vector<nanoflann::ResultItem<size_t, float>>> results;
+		size_t matches = 0;
+		for(size_t classNum = 0; classNum < classDatasets.size(); ++classNum)
+		{
+			std::vector<nanoflann::ResultItem<size_t, float>> classResults;
+			kdtrees[classNum]->radiusSearch(testDataset.getPoint(i), distances[classNum], classResults);
+			results.push_back(classResults);
+			matches += classResults.size();
+		}
 
 		if(results.empty())
 		{
@@ -259,29 +299,28 @@ int main(int argc, char** argv)
 			continue;
 		}
 
-		std::map<size_t, float> classes;
-		for(nanoflann::ResultItem<size_t, float> result : results)
+		std::map<size_t, float> classesMap;
+		for(size_t classNum = 0; classNum < results.size(); ++classNum)
 		{
-			auto search = classes.find(trainDataset[result.first].classId);
-			if(search != classes.end())
-				search->second += weightFn(result.second, searchRadius);
-			else
-				classes[trainDataset[result.first].classId] = weightFn(result.second, searchRadius);
+			for(nanoflann::ResultItem<size_t, float>& match : results[classNum])
+			{
+				auto search = classesMap.find(classDatasets[classNum][match.first].classId);
+				if(search != classesMap.end())
+					search->second += weightFn(match.second, distances[classNum]);
+				else
+					classesMap[classDatasets[classNum][match.first].classId] = weightFn(match.second, distances[classNum]);
+			}
 		}
 
-		auto search = classes.find(testDataset[i].classId);
-		float classWeight = search != classes.end() ? search->second : 0;
+		std::vector<std::pair<size_t, float>> classes(classesMap.begin(), classesMap.end());
+		std::sort(classes.begin(), classes.end(), [](auto& a, auto& b){return a.second > b.second;});
 
-		bool found = true;
-		for(auto it = classes.begin(); it != classes.end(); ++it)
+		bool found = false;
+		for(size_t j = 0; j < classes.size(); ++j)
 		{
-
-			std::cout<<"class: "<<it->first<<" found: "<<it->second<<'\n';
-
-			if(it->first == testDataset[i].classId)
-				continue;
-			else if(it->second > classWeight)
-				found = false;
+			std::cout<<"class: "<<classes[j].first<<" found: "<<classes[j].second<<'\n';
+			if(classes[j].first == testDataset[i].classId && j <= 3)
+				found = true;
 		}
 
 		hit += found;
