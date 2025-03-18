@@ -279,7 +279,6 @@ int main(int argc, char** argv)
 	size_t miss = 0;
 	size_t unkown = 0;
 
-
 	for(size_t i = 0; i < testDataset.kdtree_get_point_count(); ++i)
 	{
 		std::cout<<"\ntesting point: "<<testDataset[i].x<<' '<<testDataset[i].y<<' '<<testDataset[i].z<<" class: "<<testDataset[i].classId<<'\n';
